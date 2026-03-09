@@ -13,12 +13,17 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
+import webbrowser
 from dataclasses import dataclass, field
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import os
 
+import anyio
 import httpx
 
 CACHE_DIR = Path(os.environ.get("MCP2CLI_CACHE_DIR", Path.home() / ".cache" / "mcp2cli"))
@@ -57,6 +62,30 @@ class CommandDef:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def resolve_secret(value: str) -> str:
+    """Resolve a secret value from env var, file, or literal.
+
+    Supports:
+      env:VAR_NAME   — read from environment variable
+      file:/path     — read from file (trailing newline stripped)
+      literal value  — returned as-is
+    """
+    if value.startswith("env:"):
+        var = value[4:]
+        resolved = os.environ.get(var)
+        if resolved is None:
+            print(f"Error: environment variable {var!r} is not set", file=sys.stderr)
+            sys.exit(1)
+        return resolved
+    if value.startswith("file:"):
+        path = Path(value[5:])
+        if not path.exists():
+            print(f"Error: secret file not found: {path}", file=sys.stderr)
+            sys.exit(1)
+        return path.read_text().rstrip("\n")
+    return value
 
 
 def schema_type_to_python(schema: dict) -> tuple[type | None, str]:
@@ -179,6 +208,166 @@ def load_cached(key: str, ttl: int) -> dict | None:
 def save_cache(key: str, data: dict):
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     (CACHE_DIR / f"{key}.json").write_text(json.dumps(data))
+
+
+# ---------------------------------------------------------------------------
+# OAuth support
+# ---------------------------------------------------------------------------
+
+OAUTH_DIR = CACHE_DIR / "oauth"
+
+
+class FileTokenStorage:
+    """File-based token storage for OAuth tokens and client info."""
+
+    def __init__(self, server_url: str):
+        key = hashlib.sha256(server_url.encode()).hexdigest()[:16]
+        self._dir = OAUTH_DIR / key
+        self._dir.mkdir(parents=True, exist_ok=True)
+        self._tokens_path = self._dir / "tokens.json"
+        self._client_path = self._dir / "client.json"
+
+    async def get_tokens(self):
+        from mcp.shared.auth import OAuthToken
+
+        if not self._tokens_path.exists():
+            return None
+        try:
+            data = json.loads(self._tokens_path.read_text())
+            return OAuthToken(**data)
+        except Exception:
+            return None
+
+    async def set_tokens(self, tokens) -> None:
+        self._tokens_path.write_text(tokens.model_dump_json())
+
+    async def get_client_info(self):
+        from mcp.shared.auth import OAuthClientInformationFull
+
+        if not self._client_path.exists():
+            return None
+        try:
+            data = json.loads(self._client_path.read_text())
+            return OAuthClientInformationFull(**data)
+        except Exception:
+            return None
+
+    async def set_client_info(self, client_info) -> None:
+        self._client_path.write_text(client_info.model_dump_json())
+
+
+class _CallbackHandler(BaseHTTPRequestHandler):
+    """HTTP handler that captures the OAuth authorization code callback."""
+
+    auth_code: str | None = None
+    state: str | None = None
+    error: str | None = None
+    done = threading.Event()
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+
+        if "error" in params:
+            _CallbackHandler.error = params["error"][0]
+        elif "code" in params:
+            _CallbackHandler.auth_code = params["code"][0]
+            _CallbackHandler.state = params.get("state", [None])[0]
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        if _CallbackHandler.error:
+            self.wfile.write(b"<h1>Authorization failed</h1><p>You can close this tab.</p>")
+        else:
+            self.wfile.write(b"<h1>Authorization successful</h1><p>You can close this tab.</p>")
+        _CallbackHandler.done.set()
+
+    def log_message(self, format, *args):
+        pass  # Suppress request logging
+
+
+def _find_free_port() -> int:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def build_oauth_provider(
+    server_url: str,
+    *,
+    client_id: str | None = None,
+    client_secret: str | None = None,
+    scope: str | None = None,
+) -> "httpx.Auth":
+    """Build an OAuth provider for MCP HTTP connections.
+
+    If client_id and client_secret are provided, uses client credentials flow.
+    Otherwise, uses authorization code + PKCE with a local callback server.
+    """
+    storage = FileTokenStorage(server_url)
+
+    if client_id and client_secret:
+        from mcp.client.auth.extensions.client_credentials import ClientCredentialsOAuthProvider
+
+        return ClientCredentialsOAuthProvider(
+            server_url=server_url,
+            storage=storage,
+            client_id=client_id,
+            client_secret=client_secret,
+            scopes=scope,
+        )
+
+    from mcp.client.auth.oauth2 import OAuthClientProvider
+    from mcp.shared.auth import OAuthClientMetadata
+
+    port = _find_free_port()
+    redirect_uri = f"http://127.0.0.1:{port}/callback"
+
+    client_metadata = OAuthClientMetadata(
+        redirect_uris=[redirect_uri],
+        grant_types=["authorization_code", "refresh_token"],
+        response_types=["code"],
+        scope=scope,
+    )
+
+    # Reset callback handler state
+    _CallbackHandler.auth_code = None
+    _CallbackHandler.state = None
+    _CallbackHandler.error = None
+    _CallbackHandler.done = threading.Event()
+
+    server = HTTPServer(("127.0.0.1", port), _CallbackHandler)
+
+    async def redirect_handler(auth_url: str) -> None:
+        print(f"Opening browser for authorization...", file=sys.stderr)
+        print(f"If browser doesn't open, visit: {auth_url}", file=sys.stderr)
+        webbrowser.open(auth_url)
+
+    async def callback_handler() -> tuple[str, str | None]:
+        # Run the HTTP server in a thread, wait for the callback
+        thread = threading.Thread(target=server.handle_request, daemon=True)
+        thread.start()
+        # Wait with timeout
+        if not _CallbackHandler.done.wait(timeout=300):
+            server.server_close()
+            raise TimeoutError("OAuth callback timed out after 5 minutes")
+        server.server_close()
+        if _CallbackHandler.error:
+            raise RuntimeError(f"OAuth error: {_CallbackHandler.error}")
+        if not _CallbackHandler.auth_code:
+            raise RuntimeError("No authorization code received")
+        return (_CallbackHandler.auth_code, _CallbackHandler.state)
+
+    return OAuthClientProvider(
+        server_url=server_url,
+        client_metadata=client_metadata,
+        storage=storage,
+        redirect_handler=redirect_handler,
+        callback_handler=callback_handler,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -574,18 +763,17 @@ def run_mcp_http(
     refresh: bool,
     toon: bool = False,
     transport: str = "auto",
+    oauth_provider: httpx.Auth | None = None,
 ):
-
-    import anyio
 
     async def _run():
         from mcp import ClientSession
 
-        headers = dict(auth_headers)
+        headers = dict(auth_headers) if auth_headers else None
 
         async def _with_streamable():
             from mcp.client.streamable_http import streamablehttp_client
-            async with streamablehttp_client(url, headers=headers) as (read, write, _):
+            async with streamablehttp_client(url, headers=headers, auth=oauth_provider) as (read, write, _):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     return await _mcp_session(
@@ -595,7 +783,7 @@ def run_mcp_http(
 
         async def _with_sse():
             from mcp.client.sse import sse_client
-            async with sse_client(url, headers=headers) as (read, write):
+            async with sse_client(url, headers=headers, auth=oauth_provider) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     return await _mcp_session(
@@ -711,6 +899,7 @@ def handle_mcp(
     refresh: bool,
     toon: bool = False,
     transport: str = "auto",
+    oauth_provider: httpx.Auth | None = None,
 ):
 
 
@@ -720,7 +909,8 @@ def handle_mcp(
         if is_stdio:
             run_mcp_stdio(source, env_vars, None, None, True, pretty, raw, key, ttl, refresh, toon=toon)
         else:
-            run_mcp_http(source, auth_headers, None, None, True, pretty, raw, key, ttl, refresh, toon=toon, transport=transport)
+            run_mcp_http(source, auth_headers, None, None, True, pretty, raw, key, ttl, refresh, toon=toon,
+                         transport=transport, oauth_provider=oauth_provider)
         return
 
     # We need tool list to build argparse, try cache first
@@ -732,7 +922,8 @@ def handle_mcp(
         tools = cached_tools
     else:
         # Must connect to get tool list
-        tools = _fetch_mcp_tools(source, is_stdio, auth_headers, env_vars, transport=transport)
+        tools = _fetch_mcp_tools(source, is_stdio, auth_headers, env_vars,
+                                 transport=transport, oauth_provider=oauth_provider)
         save_cache(f"{key}_tools", tools)
 
     commands = extract_mcp_commands(tools)
@@ -770,7 +961,8 @@ def handle_mcp(
     else:
         run_mcp_http(
             source, auth_headers, cmd.tool_name, arguments, False,
-            pretty, raw, key, ttl, refresh, toon=toon, transport=transport,
+            pretty, raw, key, ttl, refresh, toon=toon,
+            transport=transport, oauth_provider=oauth_provider,
         )
 
 
@@ -780,9 +972,8 @@ def _fetch_mcp_tools(
     auth_headers: list[tuple[str, str]],
     env_vars: dict[str, str],
     transport: str = "auto",
+    oauth_provider: httpx.Auth | None = None,
 ) -> list[dict]:
-    import anyio
-
     tools_result: list[dict] = []
 
     async def _extract_tools(session):
@@ -809,18 +1000,18 @@ def _fetch_mcp_tools(
         else:
             from mcp import ClientSession
 
-            headers = dict(auth_headers)
+            headers = dict(auth_headers) if auth_headers else None
 
             async def _via_streamable():
                 from mcp.client.streamable_http import streamablehttp_client
-                async with streamablehttp_client(source, headers=headers) as (read, write, _):
+                async with streamablehttp_client(source, headers=headers, auth=oauth_provider) as (read, write, _):
                     async with ClientSession(read, write) as session:
                         await session.initialize()
                         await _extract_tools(session)
 
             async def _via_sse():
                 from mcp.client.sse import sse_client
-                async with sse_client(source, headers=headers) as (read, write):
+                async with sse_client(source, headers=headers, auth=oauth_provider) as (read, write):
                     async with ClientSession(read, write) as session:
                         await session.initialize()
                         await _extract_tools(session)
@@ -853,7 +1044,7 @@ def main():
         "--auth-header",
         action="append",
         default=[],
-        help="HTTP header as Name:Value (repeatable)",
+        help="HTTP header as Name:Value (repeatable). Value supports env:VAR and file:/path prefixes",
     )
     pre.add_argument("--base-url", default=None, help="Override base URL from spec")
     pre.add_argument("--cache-key", default=None, help="Custom cache key")
@@ -884,18 +1075,38 @@ def main():
         default=[],
         help="Environment variable KEY=VALUE for MCP stdio (repeatable)",
     )
+    pre.add_argument(
+        "--oauth",
+        action="store_true",
+        help="Enable OAuth authentication (authorization code + PKCE flow)",
+    )
+    pre.add_argument(
+        "--oauth-client-id",
+        default=None,
+        help="OAuth client ID — supports env:VAR and file:/path prefixes",
+    )
+    pre.add_argument(
+        "--oauth-client-secret",
+        default=None,
+        help="OAuth client secret — supports env:VAR and file:/path prefixes",
+    )
+    pre.add_argument(
+        "--oauth-scope",
+        default=None,
+        help="OAuth scope(s) to request",
+    )
     pre.add_argument("--version", action="version", version=f"mcp2cli {__version__}")
 
     pre_args, remaining = pre.parse_known_args()
 
-    # Parse auth headers
+    # Parse auth headers (values support env: and file: prefixes)
     auth_headers: list[tuple[str, str]] = []
     for h in pre_args.auth_header:
         if ":" not in h:
             print(f"Error: invalid auth header format: {h!r} (expected Name:Value)", file=sys.stderr)
             sys.exit(1)
         name, value = h.split(":", 1)
-        auth_headers.append((name.strip(), value.strip()))
+        auth_headers.append((name.strip(), resolve_secret(value.strip())))
 
     # Parse env vars
     env_vars: dict[str, str] = {}
@@ -919,6 +1130,28 @@ def main():
         print("Error: --spec, --mcp, and --mcp-stdio are mutually exclusive.", file=sys.stderr)
         sys.exit(1)
 
+    # --- Build OAuth provider if requested ---
+    oauth_provider = None
+    use_oauth = pre_args.oauth or pre_args.oauth_client_id or pre_args.oauth_client_secret
+    if use_oauth:
+        if pre_args.oauth_client_id and not pre_args.oauth_client_secret:
+            print("Error: --oauth-client-secret is required with --oauth-client-id", file=sys.stderr)
+            sys.exit(1)
+        if pre_args.oauth_client_secret and not pre_args.oauth_client_id:
+            print("Error: --oauth-client-id is required with --oauth-client-secret", file=sys.stderr)
+            sys.exit(1)
+        if not pre_args.mcp:
+            print("Error: OAuth is only supported with --mcp (HTTP/SSE)", file=sys.stderr)
+            sys.exit(1)
+        client_id = resolve_secret(pre_args.oauth_client_id) if pre_args.oauth_client_id else None
+        client_secret = resolve_secret(pre_args.oauth_client_secret) if pre_args.oauth_client_secret else None
+        oauth_provider = build_oauth_provider(
+            pre_args.mcp,
+            client_id=client_id,
+            client_secret=client_secret,
+            scope=pre_args.oauth_scope,
+        )
+
     # --- MCP modes ---
     if pre_args.mcp or pre_args.mcp_stdio:
         source = pre_args.mcp or pre_args.mcp_stdio
@@ -937,6 +1170,7 @@ def main():
             pre_args.refresh,
             toon=pre_args.toon,
             transport=pre_args.transport,
+            oauth_provider=oauth_provider,
         )
         return
 
