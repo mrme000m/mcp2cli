@@ -330,8 +330,10 @@ uv run pytest tests/test_token_savings.py -v -s
 
 ---
 
-<sub>mcp2cli builds on ideas from [CLIHub](https://kanyilmaz.me/2026/02/23/cli-vs-mcp.html) by Kagan Yilmaz (CLI-based tool access for token efficiency) and Anthropic's [Tool Search](https://www.anthropic.com/engineering/advanced-tool-use) (deferred tool loading). See our [blog post](https://www.orangecountyai.com/blog/mcp2cli-one-cli-for-every-api-zero-wasted-tokens) for the full analysis.</sub>
-
 ## License
 
 [MIT](LICENSE)
+
+---
+
+<sub>mcp2cli builds on ideas from [CLIHub](https://kanyilmaz.me/2026/02/23/cli-vs-mcp.html) by Kagan Yilmaz (CLI-based tool access for token efficiency)</sub>
