@@ -107,7 +107,7 @@ class TestExecuteOpenAPI:
         assert "create-pet" in r.stdout
 
     def test_list_pets(self, petstore_server):
-        r = self._run(petstore_server, "list-pets", "--pretty")
+        r = self._run(petstore_server, "--pretty", "list-pets")
         assert r.returncode == 0
         data = json.loads(r.stdout)
         assert isinstance(data, list)

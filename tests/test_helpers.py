@@ -1,5 +1,6 @@
 """Tests for helper functions and data structures."""
 
+import argparse
 import json
 import shutil
 
@@ -7,6 +8,7 @@ from mcp2cli import (
     ParamDef,
     CommandDef,
     _find_toon_cli,
+    _split_at_subcommand,
     _toon_encode,
     cache_key_for,
     coerce_value,
@@ -358,3 +360,84 @@ class TestExtractMCPCommands:
         cmds = extract_mcp_commands(tools)
         assert cmds[0].name == "list-items"
         assert cmds[0].tool_name == "list_items"
+
+
+class TestSplitAtSubcommand:
+    """Tests for _split_at_subcommand() — GH #15."""
+
+    @staticmethod
+    def _pre():
+        """Build a pre-parser with representative global options."""
+        pre = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+        pre.add_argument("--spec", default=None)
+        pre.add_argument("--mcp", default=None)
+        pre.add_argument("--env", action="append", default=[])
+        pre.add_argument("--pretty", action="store_true")
+        pre.add_argument("--refresh", action="store_true")
+        pre.add_argument("--cache-ttl", type=int, default=3600)
+        pre.add_argument("--auth-header", action="append", default=[])
+        pre.add_argument("--version", action="version", version="test")
+        return pre
+
+    def test_basic_split(self):
+        g, t = _split_at_subcommand(
+            ["--mcp", "http://server", "my-tool", "--env", "prod"], self._pre()
+        )
+        assert g == ["--mcp", "http://server"]
+        assert t == ["my-tool", "--env", "prod"]
+
+    def test_no_subcommand(self):
+        g, t = _split_at_subcommand(
+            ["--mcp", "http://server", "--pretty"], self._pre()
+        )
+        assert g == ["--mcp", "http://server", "--pretty"]
+        assert t == []
+
+    def test_boolean_flag_before_subcommand(self):
+        g, t = _split_at_subcommand(
+            ["--pretty", "--mcp", "http://server", "tool"], self._pre()
+        )
+        assert g == ["--pretty", "--mcp", "http://server"]
+        assert t == ["tool"]
+
+    def test_append_option_repeated(self):
+        g, t = _split_at_subcommand(
+            ["--env", "FOO=BAR", "--env", "BAZ=QUX", "tool"], self._pre()
+        )
+        assert g == ["--env", "FOO=BAR", "--env", "BAZ=QUX"]
+        assert t == ["tool"]
+
+    def test_double_dash_separator(self):
+        g, t = _split_at_subcommand(
+            ["--mcp", "http://server", "--", "tool", "--env", "x"], self._pre()
+        )
+        assert g == ["--mcp", "http://server"]
+        assert t == ["tool", "--env", "x"]
+
+    def test_equals_form(self):
+        g, t = _split_at_subcommand(["--mcp=http://server", "tool"], self._pre())
+        assert g == ["--mcp=http://server"]
+        assert t == ["tool"]
+
+    def test_unknown_option_before_subcommand(self):
+        g, t = _split_at_subcommand(["--unknown", "tool"], self._pre())
+        assert g == ["--unknown"]
+        assert t == ["tool"]
+
+    def test_empty_argv(self):
+        g, t = _split_at_subcommand([], self._pre())
+        assert g == []
+        assert t == []
+
+    def test_value_not_treated_as_subcommand(self):
+        g, t = _split_at_subcommand(["--mcp", "http://server"], self._pre())
+        assert g == ["--mcp", "http://server"]
+        assert t == []
+
+    def test_tool_env_preserved(self):
+        """Tool --env must not end up in the global portion."""
+        g, t = _split_at_subcommand(
+            ["--mcp", "http://s", "deploy", "--env", "production"], self._pre()
+        )
+        assert g == ["--mcp", "http://s"]
+        assert t == ["deploy", "--env", "production"]

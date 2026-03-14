@@ -58,6 +58,18 @@ async def list_tools():
                 "required": ["path"],
             },
         ),
+        Tool(
+            name="deploy",
+            description="Deploy to an environment (shadows global --env and --refresh)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "env": {"type": "string", "description": "Target environment"},
+                    "refresh": {"type": "boolean", "description": "Force refresh"},
+                },
+                "required": ["env"],
+            },
+        ),
     ]
 
 
@@ -156,6 +168,13 @@ async def call_tool(name: str, arguments: dict):
         path = arguments.get("path", "/")
         recursive = arguments.get("recursive", False)
         return [TextContent(type="text", text=f'{{"path": "{path}", "recursive": {str(recursive).lower()}, "items": ["file1.txt", "file2.txt"]}}')]
+    if name == "deploy":
+        import json as _json
+
+        return [TextContent(type="text", text=_json.dumps({
+            "env": arguments.get("env", ""),
+            "refresh": arguments.get("refresh", False),
+        }))]
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
 

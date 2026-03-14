@@ -1800,6 +1800,49 @@ def _fetch_mcp_tools(
 # ---------------------------------------------------------------------------
 
 
+def _split_at_subcommand(
+    argv: list[str], pre_parser: argparse.ArgumentParser
+) -> tuple[list[str], list[str]]:
+    """Split *argv* into ``(global_args, tool_args)`` at the subcommand boundary.
+
+    Walks *argv* consuming only tokens that belong to the global pre-parser
+    (options it defines and their values).  The first positional token that is
+    **not** a value of a preceding option is treated as the subcommand name;
+    everything from that point onward is returned as *tool_args* so that the
+    tool sub-parser can handle them — even when a tool parameter shares the
+    same name as a global option (e.g. ``--env``).
+    """
+    value_options: set[str] = set()
+    bool_options: set[str] = set()
+    for action in pre_parser._actions:
+        if not action.option_strings:
+            continue
+        if action.nargs == 0:
+            bool_options.update(action.option_strings)
+        else:
+            value_options.update(action.option_strings)
+
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            # Explicit separator: everything after belongs to the tool.
+            return argv[:i], argv[i + 1 :]
+        if arg.startswith("-"):
+            if arg.startswith("--") and "=" in arg:
+                i += 1  # --option=value  (single token)
+            elif arg in value_options:
+                i += 2  # --option value  (consumes next token)
+            elif arg in bool_options:
+                i += 1  # --flag
+            else:
+                i += 1  # unknown option — keep in global portion
+        else:
+            # First positional token = subcommand boundary
+            return argv[:i], argv[i:]
+    return argv, []
+
+
 def main():
     pre = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     pre.add_argument("--spec", default=None, help="OpenAPI spec URL or file path")
@@ -1910,7 +1953,12 @@ def main():
 
     pre.add_argument("--version", action="version", version=f"mcp2cli {__version__}")
 
-    pre_args, remaining = pre.parse_known_args()
+    # Split argv at the subcommand boundary so that tool parameters whose
+    # names collide with global options (e.g. --env, --refresh) are not
+    # silently consumed by the pre-parser.  See GH #15.
+    global_argv, tool_argv = _split_at_subcommand(sys.argv[1:], pre)
+    pre_args, leftover = pre.parse_known_args(global_argv)
+    remaining = leftover + tool_argv
 
     # Parse auth headers (values support env: and file: prefixes)
     auth_headers: list[tuple[str, str]] = []

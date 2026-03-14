@@ -91,6 +91,29 @@ class TestMCPStdio:
         r = self._run("--env", "TEST_VAR=hello", "echo", "--message", "test")
         assert r.returncode == 0
 
+    # --- GH #15: global options must not shadow tool parameters ---
+
+    def test_tool_param_not_shadowed_by_global_env(self):
+        """Tool --env parameter must not be consumed by global --env."""
+        r = self._run("deploy", "--env", "production")
+        assert r.returncode == 0
+        data = json.loads(r.stdout)
+        assert data["env"] == "production"
+
+    def test_tool_param_not_shadowed_by_global_refresh(self):
+        """Tool --refresh must not be consumed by global --refresh."""
+        r = self._run("deploy", "--env", "staging", "--refresh")
+        assert r.returncode == 0
+        data = json.loads(r.stdout)
+        assert data["refresh"] is True
+
+    def test_global_and_tool_env_coexist(self):
+        """Global --env before subcommand + tool --env after subcommand."""
+        r = self._run("--env", "X=1", "deploy", "--env", "production")
+        assert r.returncode == 0
+        data = json.loads(r.stdout)
+        assert data["env"] == "production"
+
     def test_tool_caching(self, tmp_path, monkeypatch):
         """Run twice — second should use cached tool list."""
         import mcp2cli
