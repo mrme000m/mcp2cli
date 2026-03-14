@@ -798,7 +798,7 @@ def execute_openapi(
             sys.exit(1)
 
     if raw:
-        print(resp.text)
+        sys.stdout.buffer.write(resp.content)
         return
 
     try:
