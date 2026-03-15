@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "2.1.0"
+__version__ = "2.2.1"
 
 import argparse
 import copy
@@ -106,6 +106,31 @@ def resolve_secret(value: str) -> str:
             sys.exit(1)
         return path.read_text().rstrip("\n")
     return value
+
+
+def _parse_kv_list(
+    items: list[str],
+    delimiter: str,
+    label: str,
+    *,
+    resolve_values: bool = False,
+) -> list[tuple[str, str]]:
+    """Parse a list of 'KEY<delimiter>VALUE' strings into (key, value) pairs.
+
+    Exits with an error message if any item is missing the delimiter.
+    When *resolve_values* is True, each value is passed through :func:`resolve_secret`.
+    """
+    result: list[tuple[str, str]] = []
+    for item in items:
+        if delimiter not in item:
+            print(f"Error: invalid {label} format: {item!r}", file=sys.stderr)
+            sys.exit(1)
+        k, v = item.split(delimiter, 1)
+        k, v = k.strip(), v.strip()
+        if resolve_values:
+            v = resolve_secret(v)
+        result.append((k, v))
+    return result
 
 
 def read_stdin_json(context: str):
@@ -249,6 +274,22 @@ def output_result(data, *, pretty: bool = False, raw: bool = False, toon: bool =
         print(json.dumps(data, indent=2))
     else:
         print(json.dumps(data))
+
+
+def _build_http_headers(auth_headers: list[tuple[str, str]]) -> dict[str, str]:
+    """Build HTTP headers dict from auth_headers with a Content-Type default."""
+    headers = dict(auth_headers)
+    headers.setdefault("Content-Type", "application/json")
+    return headers
+
+
+def _handle_http_error(resp) -> None:
+    """Print error and exit(1) on non-2xx HTTP response."""
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError:
+        print(f"Error {resp.status_code}: {resp.text}", file=sys.stderr)
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -875,6 +916,60 @@ def load_graphql_schema(
     return schema
 
 
+def _detect_field_collisions(
+    query_fields: list[dict], mutation_fields: list[dict]
+) -> set[str]:
+    """Return field names that appear in both query and mutation types."""
+    all_names: set[str] = set()
+    collisions: set[str] = set()
+    for f in query_fields + mutation_fields:
+        n = f["name"]
+        if n in all_names:
+            collisions.add(n)
+        all_names.add(n)
+    return collisions
+
+
+def _build_graphql_param(arg: dict, types_by_name: dict) -> ParamDef:
+    """Convert a single GraphQL field argument into a ParamDef."""
+    py_type, required, choices = graphql_type_to_python(arg["type"], types_by_name)
+    gql_type_str = _graphql_type_string(arg["type"])
+    named_t, _, is_list = _unwrap_type(arg["type"])
+
+    # Build schema for coerce_value
+    param_schema: dict = {"graphql_type": gql_type_str}
+    if is_list:
+        param_schema["type"] = "array"
+        inner_named, _, _ = _unwrap_type(named_t)
+        item_type_name = inner_named.get("name", "String")
+        item_map = {
+            "Int": "integer", "Float": "number", "String": "string",
+            "ID": "string", "Boolean": "boolean",
+        }
+        param_schema["items"] = {"type": item_map.get(item_type_name, "string")}
+    elif named_t.get("kind") == "INPUT_OBJECT":
+        param_schema["type"] = "object"
+    elif named_t.get("kind") == "ENUM":
+        param_schema["type"] = "string"
+
+    arg_desc = arg.get("description") or arg["name"]
+    if is_list:
+        arg_desc += " (JSON array)"
+    elif named_t.get("kind") == "INPUT_OBJECT":
+        arg_desc += " (JSON object)"
+
+    return ParamDef(
+        name=to_kebab(arg["name"]),
+        original_name=arg["name"],
+        python_type=py_type,
+        required=required,
+        description=arg_desc,
+        choices=choices,
+        location="graphql_arg",
+        schema=param_schema,
+    )
+
+
 def extract_graphql_commands(schema: dict) -> list[CommandDef]:
     """Convert introspection schema into CommandDef list."""
     types_by_name = {t["name"]: t for t in schema.get("types", []) if t.get("name")}
@@ -885,16 +980,9 @@ def extract_graphql_commands(schema: dict) -> list[CommandDef]:
     commands: list[CommandDef] = []
     seen_names: set[str] = set()
 
-    # Collect field names to detect collisions
     query_fields = types_by_name.get(query_type_name, {}).get("fields", []) if query_type_name else []
     mutation_fields = types_by_name.get(mutation_type_name, {}).get("fields", []) if mutation_type_name else []
-    all_field_names = set()
-    collisions = set()
-    for f in query_fields + mutation_fields:
-        n = f["name"]
-        if n in all_field_names:
-            collisions.add(n)
-        all_field_names.add(n)
+    collisions = _detect_field_collisions(query_fields, mutation_fields)
 
     for op_type, type_name, fields in [
         ("query", query_type_name, query_fields),
@@ -902,7 +990,6 @@ def extract_graphql_commands(schema: dict) -> list[CommandDef]:
     ]:
         for field_def in fields:
             field_name = field_def["name"]
-            # Skip introspection fields
             if field_name.startswith("__"):
                 continue
 
@@ -910,53 +997,15 @@ def extract_graphql_commands(schema: dict) -> list[CommandDef]:
             if field_name in collisions:
                 cli_name = f"{op_type}-{cli_name}"
 
-            # Deduplicate
             if cli_name in seen_names:
                 cli_name = f"{op_type}-{cli_name}"
             seen_names.add(cli_name)
 
             desc = field_def.get("description") or f"{op_type} {field_name}"
-
-            params: list[ParamDef] = []
-            for arg in field_def.get("args", []):
-                py_type, required, choices = graphql_type_to_python(
-                    arg["type"], types_by_name
-                )
-                gql_type_str = _graphql_type_string(arg["type"])
-                named_t, _, is_list = _unwrap_type(arg["type"])
-
-                # Build schema for coerce_value
-                param_schema: dict = {"graphql_type": gql_type_str}
-                if is_list:
-                    param_schema["type"] = "array"
-                    # Determine item type
-                    inner_named, _, _ = _unwrap_type(named_t)
-                    item_type_name = inner_named.get("name", "String")
-                    item_map = {"Int": "integer", "Float": "number", "String": "string", "ID": "string", "Boolean": "boolean"}
-                    param_schema["items"] = {"type": item_map.get(item_type_name, "string")}
-                elif named_t.get("kind") == "INPUT_OBJECT":
-                    param_schema["type"] = "object"
-                elif named_t.get("kind") == "ENUM":
-                    param_schema["type"] = "string"
-
-                arg_desc = arg.get("description") or arg["name"]
-                if is_list:
-                    arg_desc += " (JSON array)"
-                elif named_t.get("kind") == "INPUT_OBJECT":
-                    arg_desc += " (JSON object)"
-
-                params.append(
-                    ParamDef(
-                        name=to_kebab(arg["name"]),
-                        original_name=arg["name"],
-                        python_type=py_type,
-                        required=required,
-                        description=arg_desc,
-                        choices=choices,
-                        location="graphql_arg",
-                        schema=param_schema,
-                    )
-                )
+            params = [
+                _build_graphql_param(arg, types_by_name)
+                for arg in field_def.get("args", [])
+            ]
 
             commands.append(
                 CommandDef(
@@ -991,19 +1040,16 @@ def list_graphql_commands(commands: list[CommandDef]):
             print(f"  {cmd.name:<40}{desc}")
 
 
-def execute_graphql(
-    args: argparse.Namespace,
+def _build_graphql_document(
     cmd: CommandDef,
-    url: str,
+    args: argparse.Namespace,
     schema: dict,
-    auth_headers: list[tuple[str, str]],
-    pretty: bool,
-    raw: bool,
-    toon: bool = False,
     fields_override: str | None = None,
-    oauth_provider: "httpx.Auth | None" = None,
-):
-    """Build and execute a GraphQL query/mutation."""
+) -> tuple[str, dict, str]:
+    """Build a GraphQL document string and variables dict from parsed args.
+
+    Returns (document, variables, field_name).
+    """
     types_by_name = {t["name"]: t for t in schema.get("types", []) if t.get("name")}
 
     # Build variables dict from args
@@ -1043,9 +1089,27 @@ def execute_graphql(
     var_decls_str = f"({', '.join(var_decls)})" if var_decls else ""
 
     document = f"{op_type}{var_decls_str} {{ {field_name}{args_str} {selection} }}"
+    return document, variables, field_name
 
-    headers = dict(auth_headers)
-    headers.setdefault("Content-Type", "application/json")
+
+def execute_graphql(
+    args: argparse.Namespace,
+    cmd: CommandDef,
+    url: str,
+    schema: dict,
+    auth_headers: list[tuple[str, str]],
+    pretty: bool,
+    raw: bool,
+    toon: bool = False,
+    fields_override: str | None = None,
+    oauth_provider: "httpx.Auth | None" = None,
+):
+    """Build and execute a GraphQL query/mutation."""
+    document, variables, field_name = _build_graphql_document(
+        cmd, args, schema, fields_override
+    )
+
+    headers = _build_http_headers(auth_headers)
 
     with httpx.Client(timeout=60, auth=oauth_provider) as client:
         resp = client.post(
@@ -1053,11 +1117,7 @@ def execute_graphql(
             headers=headers,
             json={"query": document, "variables": variables or None},
         )
-        try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError:
-            print(f"Error {resp.status_code}: {resp.text}", file=sys.stderr)
-            sys.exit(1)
+        _handle_http_error(resp)
 
     result = resp.json()
     if "errors" in result:
@@ -1293,21 +1353,8 @@ def _bake_create(argv: list[str]) -> None:
     else:
         source_type, source = "mcp_stdio", args.mcp_stdio
 
-    auth_headers = []
-    for h in args.auth_header:
-        if ":" not in h:
-            print(f"Error: invalid auth header format: {h!r}", file=sys.stderr)
-            sys.exit(1)
-        name, value = h.split(":", 1)
-        auth_headers.append([name.strip(), value.strip()])
-
-    env_vars = {}
-    for e in args.env:
-        if "=" not in e:
-            print(f"Error: invalid env format: {e!r}", file=sys.stderr)
-            sys.exit(1)
-        k, v = e.split("=", 1)
-        env_vars[k] = v
+    auth_headers = [list(t) for t in _parse_kv_list(args.auth_header, ":", "auth header")]
+    env_vars = dict(_parse_kv_list(args.env, "=", "env"))
 
     config = {
         "source_type": source_type,
@@ -1561,6 +1608,62 @@ def _filter_commands(commands: list[CommandDef], pattern: str) -> list[CommandDe
 # ---------------------------------------------------------------------------
 
 
+def _collect_openapi_params(
+    cmd: CommandDef,
+    args: argparse.Namespace,
+) -> tuple[str, dict[str, str], dict[str, str], dict | None]:
+    """Collect OpenAPI params from parsed args, separated by location.
+
+    Returns (path, query_params, extra_headers, body_or_none) where *path*
+    has ``{param}`` placeholders substituted with actual values.
+    """
+    path = cmd.path or ""
+    query_params: dict[str, str] = {}
+    extra_headers: dict[str, str] = {}
+    body: dict | None = None
+
+    for p in cmd.params:
+        if p.location == "path":
+            val = getattr(args, p.name.replace("-", "_"), None)
+            if val is not None:
+                path = path.replace(f"{{{p.original_name}}}", str(val))
+
+    if cmd.method == "get":
+        for p in cmd.params:
+            val = getattr(args, p.name.replace("-", "_"), None)
+            if val is None:
+                continue
+            if p.location == "query":
+                query_params[p.original_name] = val
+            elif p.location == "header":
+                extra_headers[p.original_name] = str(val)
+    else:
+        if getattr(args, "stdin", False):
+            body = read_stdin_json("OpenAPI request body")
+        else:
+            body = {}
+            for p in cmd.params:
+                val = getattr(args, p.name.replace("-", "_"), None)
+                if p.location == "header":
+                    if val is not None:
+                        extra_headers[p.original_name] = str(val)
+                    continue
+                if p.location == "path":
+                    continue
+                if val is not None:
+                    body[p.original_name] = val
+            if not body:
+                body = None
+        # Also collect query params for non-GET
+        for p in cmd.params:
+            if p.location == "query":
+                val = getattr(args, p.name.replace("-", "_"), None)
+                if val is not None:
+                    query_params[p.original_name] = val
+
+    return path, query_params, extra_headers, body
+
+
 def execute_openapi(
     args: argparse.Namespace,
     cmd: CommandDef,
@@ -1571,55 +1674,11 @@ def execute_openapi(
     toon: bool = False,
     oauth_provider: "httpx.Auth | None" = None,
 ):
-    path = cmd.path or ""
-    # Substitute path parameters
-    for p in cmd.params:
-        if p.location == "path":
-            val = getattr(args, p.name.replace("-", "_"), None)
-            if val is not None:
-                path = path.replace(f"{{{p.original_name}}}", str(val))
-
+    path, query_params, extra_headers, body = _collect_openapi_params(cmd, args)
     url = base_url.rstrip("/") + path
 
-    headers = dict(auth_headers)
-    headers.setdefault("Content-Type", "application/json")
-    query_params = {}
-    body = None
-
-    if cmd.method == "get":
-        for p in cmd.params:
-            if p.location == "query":
-                val = getattr(args, p.name.replace("-", "_"), None)
-                if val is not None:
-                    query_params[p.original_name] = val
-            elif p.location == "header":
-                val = getattr(args, p.name.replace("-", "_"), None)
-                if val is not None:
-                    headers[p.original_name] = str(val)
-    else:
-        if getattr(args, "stdin", False):
-            body = read_stdin_json("OpenAPI request body")
-        else:
-            body = {}
-            for p in cmd.params:
-                if p.location == "header":
-                    val = getattr(args, p.name.replace("-", "_"), None)
-                    if val is not None:
-                        headers[p.original_name] = str(val)
-                    continue
-                if p.location == "path":
-                    continue
-                val = getattr(args, p.name.replace("-", "_"), None)
-                if val is not None:
-                    body[p.original_name] = val
-            # Also collect query params for non-GET
-            for p in cmd.params:
-                if p.location == "query":
-                    val = getattr(args, p.name.replace("-", "_"), None)
-                    if val is not None:
-                        query_params[p.original_name] = val
-            if not body:
-                body = None
+    headers = _build_http_headers(auth_headers)
+    headers.update(extra_headers)
 
     with httpx.Client(timeout=60, auth=oauth_provider) as client:
         resp = client.request(
@@ -1629,11 +1688,7 @@ def execute_openapi(
             params=query_params or None,
             json=body,
         )
-        try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError:
-            print(f"Error {resp.status_code}: {resp.text}", file=sys.stderr)
-            sys.exit(1)
+        _handle_http_error(resp)
 
     if raw:
         sys.stdout.buffer.write(resp.content)
@@ -1867,15 +1922,7 @@ async def _mcp_session(
 
     result = await session.call_tool(tool_name, arguments or {})
 
-    # Extract text content
-    output_parts = []
-    for content in result.content:
-        if hasattr(content, "text"):
-            output_parts.append(content.text)
-        elif hasattr(content, "data"):
-            output_parts.append(content.data)
-
-    text = "\n".join(output_parts) if output_parts else ""
+    text = _extract_content_parts(result.content)
     output_result(text, pretty=pretty, raw=raw, toon=toon)
 
 
@@ -2110,6 +2157,91 @@ def session_start(
     sys.exit(1)
 
 
+def _extract_content_parts(content_list, *, attrs=("text", "data")) -> str:
+    """Extract text/data/blob from MCP content objects, joined by newline."""
+    parts = []
+    for c in content_list:
+        for attr in attrs:
+            if hasattr(c, attr):
+                parts.append(getattr(c, attr))
+                break
+    return "\n".join(parts) if parts else ""
+
+
+async def _dispatch_list_tools(session, params):
+    result = await session.list_tools()
+    return [
+        {"name": t.name, "description": t.description or "", "inputSchema": t.inputSchema or {}}
+        for t in result.tools
+    ]
+
+
+async def _dispatch_call_tool(session, params):
+    result = await session.call_tool(params["name"], params.get("arguments", {}))
+    return _extract_content_parts(result.content)
+
+
+async def _dispatch_list_resources(session, params):
+    result = await session.list_resources()
+    return [
+        {"name": r.name, "uri": str(r.uri), "description": r.description or "", "mimeType": r.mimeType or ""}
+        for r in result.resources
+    ]
+
+
+async def _dispatch_read_resource(session, params):
+    from pydantic import AnyUrl
+
+    result = await session.read_resource(AnyUrl(params["uri"]))
+    return _extract_content_parts(result.contents, attrs=("text", "blob"))
+
+
+async def _dispatch_list_resource_templates(session, params):
+    result = await session.list_resource_templates()
+    return [
+        {"name": t.name, "uriTemplate": str(t.uriTemplate), "description": t.description or "", "mimeType": t.mimeType or ""}
+        for t in result.resourceTemplates
+    ]
+
+
+async def _dispatch_list_prompts(session, params):
+    result = await session.list_prompts()
+    return [
+        {
+            "name": p.name,
+            "description": p.description or "",
+            "arguments": [
+                {"name": a.name, "description": a.description or "", "required": a.required or False}
+                for a in (p.arguments or [])
+            ],
+        }
+        for p in result.prompts
+    ]
+
+
+async def _dispatch_get_prompt(session, params):
+    result = await session.get_prompt(params["name"], params.get("arguments", {}))
+    messages = []
+    for msg in result.messages:
+        content = msg.content
+        if hasattr(content, "text"):
+            messages.append({"role": msg.role, "content": content.text})
+        else:
+            messages.append({"role": msg.role, "content": json.dumps(content.model_dump())})
+    return {"description": result.description or "", "messages": messages}
+
+
+_SESSION_DISPATCH = {
+    "list_tools": _dispatch_list_tools,
+    "call_tool": _dispatch_call_tool,
+    "list_resources": _dispatch_list_resources,
+    "read_resource": _dispatch_read_resource,
+    "list_resource_templates": _dispatch_list_resource_templates,
+    "list_prompts": _dispatch_list_prompts,
+    "get_prompt": _dispatch_get_prompt,
+}
+
+
 def _run_session_daemon(config_json: str):
     """Entry point for the session daemon process."""
     config = json.loads(config_json)
@@ -2127,93 +2259,10 @@ def _run_session_daemon(config_json: str):
 
     async def _dispatch(session, method: str, params: dict):
         """Dispatch a method call to the MCP session."""
-        if method == "list_tools":
-            result = await session.list_tools()
-            return [
-                {
-                    "name": t.name,
-                    "description": t.description or "",
-                    "inputSchema": t.inputSchema or {},
-                }
-                for t in result.tools
-            ]
-        elif method == "call_tool":
-            result = await session.call_tool(
-                params["name"], params.get("arguments", {})
-            )
-            parts = []
-            for c in result.content:
-                if hasattr(c, "text"):
-                    parts.append(c.text)
-                elif hasattr(c, "data"):
-                    parts.append(c.data)
-            return "\n".join(parts)
-        elif method == "list_resources":
-            result = await session.list_resources()
-            return [
-                {
-                    "name": r.name,
-                    "uri": str(r.uri),
-                    "description": r.description or "",
-                    "mimeType": r.mimeType or "",
-                }
-                for r in result.resources
-            ]
-        elif method == "read_resource":
-            from pydantic import AnyUrl
-
-            result = await session.read_resource(AnyUrl(params["uri"]))
-            parts = []
-            for c in result.contents:
-                if hasattr(c, "text"):
-                    parts.append(c.text)
-                elif hasattr(c, "blob"):
-                    parts.append(c.blob)
-            return "\n".join(parts)
-        elif method == "list_resource_templates":
-            result = await session.list_resource_templates()
-            return [
-                {
-                    "name": t.name,
-                    "uriTemplate": str(t.uriTemplate),
-                    "description": t.description or "",
-                    "mimeType": t.mimeType or "",
-                }
-                for t in result.resourceTemplates
-            ]
-        elif method == "list_prompts":
-            result = await session.list_prompts()
-            return [
-                {
-                    "name": p.name,
-                    "description": p.description or "",
-                    "arguments": [
-                        {
-                            "name": a.name,
-                            "description": a.description or "",
-                            "required": a.required or False,
-                        }
-                        for a in (p.arguments or [])
-                    ],
-                }
-                for p in result.prompts
-            ]
-        elif method == "get_prompt":
-            result = await session.get_prompt(
-                params["name"], params.get("arguments", {})
-            )
-            messages = []
-            for msg in result.messages:
-                content = msg.content
-                if hasattr(content, "text"):
-                    messages.append({"role": msg.role, "content": content.text})
-                else:
-                    messages.append(
-                        {"role": msg.role, "content": json.dumps(content.model_dump())}
-                    )
-            return {"description": result.description or "", "messages": messages}
-        else:
+        handler = _SESSION_DISPATCH.get(method)
+        if handler is None:
             raise ValueError(f"Unknown method: {method}")
+        return await handler(session, params)
 
     async def _daemon():
         from mcp import ClientSession
@@ -2393,6 +2442,63 @@ def _session_request(name: str, method: str, params: dict | None = None) -> any:
 # ---------------------------------------------------------------------------
 
 
+def _fetch_or_cache_mcp_tools(
+    key: str,
+    ttl: int,
+    refresh: bool,
+    source: str,
+    is_stdio: bool,
+    auth_headers: list[tuple[str, str]],
+    env_vars: dict[str, str],
+    transport: str = "auto",
+    oauth_provider: httpx.Auth | None = None,
+) -> list[dict]:
+    """Load MCP tools from cache or fetch from server, caching the result."""
+    if not refresh:
+        cached = load_cached(f"{key}_tools", ttl)
+        if cached is not None:
+            return cached
+    tools = _fetch_mcp_tools(
+        source, is_stdio, auth_headers, env_vars,
+        transport=transport, oauth_provider=oauth_provider,
+    )
+    save_cache(f"{key}_tools", tools)
+    return tools
+
+
+def _dispatch_mcp_call(
+    source: str,
+    is_stdio: bool,
+    auth_headers: list[tuple[str, str]],
+    env_vars: dict[str, str],
+    tool_name: str | None,
+    arguments: dict | None,
+    list_mode: bool,
+    pretty: bool,
+    raw: bool,
+    cache_key: str,
+    ttl: int,
+    refresh: bool,
+    *,
+    toon: bool = False,
+    transport: str = "auto",
+    oauth_provider: httpx.Auth | None = None,
+    **extra,
+) -> None:
+    """Route to run_mcp_stdio or run_mcp_http based on is_stdio."""
+    if is_stdio:
+        run_mcp_stdio(
+            source, env_vars, tool_name, arguments, list_mode,
+            pretty, raw, cache_key, ttl, refresh, toon=toon, **extra,
+        )
+    else:
+        run_mcp_http(
+            source, auth_headers, tool_name, arguments, list_mode,
+            pretty, raw, cache_key, ttl, refresh, toon=toon,
+            transport=transport, oauth_provider=oauth_provider, **extra,
+        )
+
+
 def handle_mcp(
     source: str,
     is_stdio: bool,
@@ -2427,54 +2533,21 @@ def handle_mcp(
             prompt_name=prompt_name,
             prompt_arguments=prompt_arguments,
         )
-        if is_stdio:
-            run_mcp_stdio(
-                source,
-                env_vars,
-                None,
-                None,
-                False,
-                pretty,
-                raw,
-                key,
-                ttl,
-                refresh,
-                toon=toon,
-                **extra,
-            )
-        else:
-            run_mcp_http(
-                source,
-                auth_headers,
-                None,
-                None,
-                False,
-                pretty,
-                raw,
-                key,
-                ttl,
-                refresh,
-                toon=toon,
-                transport=transport,
-                oauth_provider=oauth_provider,
-                **extra,
-            )
+        _dispatch_mcp_call(
+            source, is_stdio, auth_headers, env_vars,
+            None, None, False, pretty, raw, key, ttl, refresh,
+            toon=toon, transport=transport, oauth_provider=oauth_provider,
+            **extra,
+        )
         return
 
     if list_mode:
         if bake_config and (bake_config.include or bake_config.exclude or bake_config.methods):
             # Fetch tools, filter, then list — don't delegate to unfiltered path
-            cached_tools = None
-            if not refresh:
-                cached_tools = load_cached(f"{key}_tools", ttl)
-            if cached_tools is not None:
-                tools = cached_tools
-            else:
-                tools = _fetch_mcp_tools(
-                    source, is_stdio, auth_headers, env_vars,
-                    transport=transport, oauth_provider=oauth_provider,
-                )
-                save_cache(f"{key}_tools", tools)
+            tools = _fetch_or_cache_mcp_tools(
+                key, ttl, refresh, source, is_stdio, auth_headers, env_vars,
+                transport=transport, oauth_provider=oauth_provider,
+            )
             commands = extract_mcp_commands(tools)
             commands = filter_commands(
                 commands, bake_config.include, bake_config.exclude, bake_config.methods,
@@ -2482,58 +2555,19 @@ def handle_mcp(
             print("\nAvailable tools:")
             list_mcp_commands(commands)
             return
-        if is_stdio:
-            run_mcp_stdio(
-                source,
-                env_vars,
-                None,
-                None,
-                True,
-                pretty,
-                raw,
-                key,
-                ttl,
-                refresh,
-                toon=toon,
-                search_pattern=search_pattern,
-            )
-        else:
-            run_mcp_http(
-                source,
-                auth_headers,
-                None,
-                None,
-                True,
-                pretty,
-                raw,
-                key,
-                ttl,
-                refresh,
-                toon=toon,
-                transport=transport,
-                oauth_provider=oauth_provider,
-                search_pattern=search_pattern,
-            )
+        _dispatch_mcp_call(
+            source, is_stdio, auth_headers, env_vars,
+            None, None, True, pretty, raw, key, ttl, refresh,
+            toon=toon, transport=transport, oauth_provider=oauth_provider,
+            search_pattern=search_pattern,
+        )
         return
 
     # We need tool list to build argparse, try cache first
-    cached_tools = None
-    if not refresh:
-        cached_tools = load_cached(f"{key}_tools", ttl)
-
-    if cached_tools is not None:
-        tools = cached_tools
-    else:
-        # Must connect to get tool list
-        tools = _fetch_mcp_tools(
-            source,
-            is_stdio,
-            auth_headers,
-            env_vars,
-            transport=transport,
-            oauth_provider=oauth_provider,
-        )
-        save_cache(f"{key}_tools", tools)
+    tools = _fetch_or_cache_mcp_tools(
+        key, ttl, refresh, source, is_stdio, auth_headers, env_vars,
+        transport=transport, oauth_provider=oauth_provider,
+    )
 
     commands = extract_mcp_commands(tools)
     if bake_config:
@@ -2566,36 +2600,11 @@ def handle_mcp(
             if val is not None:
                 arguments[p.original_name] = coerce_value(val, p.schema)
 
-    if is_stdio:
-        run_mcp_stdio(
-            source,
-            env_vars,
-            cmd.tool_name,
-            arguments,
-            False,
-            pretty,
-            raw,
-            key,
-            ttl,
-            refresh,
-            toon=toon,
-        )
-    else:
-        run_mcp_http(
-            source,
-            auth_headers,
-            cmd.tool_name,
-            arguments,
-            False,
-            pretty,
-            raw,
-            key,
-            ttl,
-            refresh,
-            toon=toon,
-            transport=transport,
-            oauth_provider=oauth_provider,
-        )
+    _dispatch_mcp_call(
+        source, is_stdio, auth_headers, env_vars,
+        cmd.tool_name, arguments, False, pretty, raw, key, ttl, refresh,
+        toon=toon, transport=transport, oauth_provider=oauth_provider,
+    )
 
 
 def _fetch_mcp_tools(
@@ -2733,7 +2742,8 @@ def main():
     _main_impl(sys.argv[1:])
 
 
-def _main_impl(argv: list[str], bake_config: BakeConfig | None = None):
+def _build_main_parser() -> argparse.ArgumentParser:
+    """Build the global ArgumentParser for _main_impl."""
     pre = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     pre.add_argument("--spec", default=None, help="OpenAPI spec URL or file path")
     pre.add_argument("--mcp", default=None, help="MCP server URL (HTTP/SSE)")
@@ -2823,7 +2833,6 @@ def _main_impl(argv: list[str], bake_config: BakeConfig | None = None):
     pre.add_argument(
         "--read-resource", default=None, metavar="URI", help="Read a resource by URI"
     )
-
     # Prompt flags
     pre.add_argument(
         "--list-prompts", action="store_true", help="List available prompts"
@@ -2838,7 +2847,6 @@ def _main_impl(argv: list[str], bake_config: BakeConfig | None = None):
         metavar="KEY=VALUE",
         help="Argument for --get-prompt (repeatable)",
     )
-
     # Session flags
     pre.add_argument(
         "--session-start",
@@ -2853,51 +2861,18 @@ def _main_impl(argv: list[str], bake_config: BakeConfig | None = None):
     pre.add_argument(
         "--session", default=None, metavar="NAME", help="Use an existing session"
     )
-
     pre.add_argument("--version", action="version", version=f"mcp2cli {__version__}")
+    return pre
 
-    # Split argv at the subcommand boundary so that tool parameters whose
-    # names collide with global options (e.g. --env, --refresh) are not
-    # silently consumed by the pre-parser.  See GH #15.
-    global_argv, tool_argv = _split_at_subcommand(argv, pre)
-    pre_args, leftover = pre.parse_known_args(global_argv)
-    remaining = leftover + tool_argv
 
-    # --search implies --list
-    search_pattern = pre_args.search_pattern
-    if search_pattern:
-        pre_args.list_commands = True
+def _validate_source_modes(pre_args, pre, remaining) -> None:
+    """Validate mutual exclusivity of --spec/--mcp/--mcp-stdio/--graphql.
 
-    # Parse auth headers (values support env: and file: prefixes)
-    auth_headers: list[tuple[str, str]] = []
-    for h in pre_args.auth_header:
-        if ":" not in h:
-            print(
-                f"Error: invalid auth header format: {h!r} (expected Name:Value)",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        name, value = h.split(":", 1)
-        auth_headers.append((name.strip(), resolve_secret(value.strip())))
-
-    # Parse env vars
-    env_vars: dict[str, str] = {}
-    for e in pre_args.env:
-        if "=" not in e:
-            print(
-                f"Error: invalid env format: {e!r} (expected KEY=VALUE)",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        k, v = e.split("=", 1)
-        env_vars[k] = v
-
-    # Session management commands don't require a source
+    Exits on validation failure.  Session commands don't require a source.
+    """
     needs_source = not (
         pre_args.session_list or pre_args.session_stop or pre_args.session
     )
-
-    # Validate mutual exclusivity
     modes = [pre_args.spec, pre_args.mcp, pre_args.mcp_stdio, pre_args.graphql]
     active = sum(1 for m in modes if m is not None)
     if needs_source:
@@ -2917,60 +2892,75 @@ def _main_impl(argv: list[str], bake_config: BakeConfig | None = None):
         )
         sys.exit(1)
 
-    # --- Build OAuth provider if requested ---
-    oauth_provider = None
+
+def _setup_oauth(pre_args):
+    """Build OAuth provider if --oauth flags are present.
+
+    Returns oauth_provider or None.  Exits on invalid flag combinations.
+    """
     use_oauth = (
         pre_args.oauth or pre_args.oauth_client_id or pre_args.oauth_client_secret
     )
-    if use_oauth:
-        if pre_args.oauth_client_id and not pre_args.oauth_client_secret:
-            print(
-                "Error: --oauth-client-secret is required with --oauth-client-id",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        if pre_args.oauth_client_secret and not pre_args.oauth_client_id:
-            print(
-                "Error: --oauth-client-id is required with --oauth-client-secret",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        if pre_args.mcp_stdio:
-            print(
-                "Error: OAuth is not supported with --mcp-stdio", file=sys.stderr
-            )
-            sys.exit(1)
-        # Determine OAuth server URL for discovery
-        server_url = pre_args.mcp or pre_args.graphql
-        if not server_url and pre_args.spec:
-            if pre_args.spec.startswith("http"):
-                server_url = pre_args.spec
-            else:
-                server_url = pre_args.base_url
-        if not server_url:
-            print(
-                "Error: OAuth requires an HTTP URL (use --base-url with local spec files)",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        client_id = (
-            resolve_secret(pre_args.oauth_client_id)
-            if pre_args.oauth_client_id
-            else None
-        )
-        client_secret = (
-            resolve_secret(pre_args.oauth_client_secret)
-            if pre_args.oauth_client_secret
-            else None
-        )
-        oauth_provider = build_oauth_provider(
-            server_url,
-            client_id=client_id,
-            client_secret=client_secret,
-            scope=pre_args.oauth_scope,
-        )
+    if not use_oauth:
+        return None
 
-    # --- Session management (no source required) ---
+    if pre_args.oauth_client_id and not pre_args.oauth_client_secret:
+        print(
+            "Error: --oauth-client-secret is required with --oauth-client-id",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if pre_args.oauth_client_secret and not pre_args.oauth_client_id:
+        print(
+            "Error: --oauth-client-id is required with --oauth-client-secret",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if pre_args.mcp_stdio:
+        print(
+            "Error: OAuth is not supported with --mcp-stdio", file=sys.stderr
+        )
+        sys.exit(1)
+    # Determine OAuth server URL for discovery
+    server_url = pre_args.mcp or pre_args.graphql
+    if not server_url and pre_args.spec:
+        if pre_args.spec.startswith("http"):
+            server_url = pre_args.spec
+        else:
+            server_url = pre_args.base_url
+    if not server_url:
+        print(
+            "Error: OAuth requires an HTTP URL (use --base-url with local spec files)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    client_id = (
+        resolve_secret(pre_args.oauth_client_id) if pre_args.oauth_client_id else None
+    )
+    client_secret = (
+        resolve_secret(pre_args.oauth_client_secret)
+        if pre_args.oauth_client_secret
+        else None
+    )
+    return build_oauth_provider(
+        server_url,
+        client_id=client_id,
+        client_secret=client_secret,
+        scope=pre_args.oauth_scope,
+    )
+
+
+def _handle_session_operations(
+    pre_args,
+    auth_headers: list[tuple[str, str]],
+    env_vars: dict[str, str],
+    remaining: list[str],
+    search_pattern: str | None,
+) -> bool:
+    """Handle --session-list, --session-stop, --session-start, --session.
+
+    Returns True if a session operation was handled (caller should return).
+    """
     if pre_args.session_list:
         sessions = session_list()
         if not sessions:
@@ -2981,12 +2971,12 @@ def _main_impl(argv: list[str], bake_config: BakeConfig | None = None):
                 print(
                     f"  {s['name']:<20} {s['transport']:<8} {status}  PID={s.get('pid', '?')}"
                 )
-        return
+        return True
 
     if pre_args.session_stop:
         session_stop(pre_args.session_stop)
         print(f"Session '{pre_args.session_stop}' stopped.")
-        return
+        return True
 
     if pre_args.session_start:
         if not (pre_args.mcp or pre_args.mcp_stdio):
@@ -3004,110 +2994,112 @@ def _main_impl(argv: list[str], bake_config: BakeConfig | None = None):
             env_vars,
             transport=pre_args.transport,
         )
-        return
+        return True
+
+    if not pre_args.session:
+        return False
 
     # --- Session client mode ---
-    if pre_args.session:
-        sess_name = pre_args.session
-        # Determine resource/prompt action
-        resource_action = resource_uri = prompt_action = prompt_name = None
-        prompt_arguments: dict = {}
+    sess_name = pre_args.session
 
-        if pre_args.list_resources:
-            result = _session_request(sess_name, "list_resources")
-            output_result(
-                result, pretty=pre_args.pretty, raw=pre_args.raw, toon=pre_args.toon
-            )
-            return
-        if pre_args.list_resource_templates:
-            result = _session_request(sess_name, "list_resource_templates")
-            output_result(
-                result, pretty=pre_args.pretty, raw=pre_args.raw, toon=pre_args.toon
-            )
-            return
-        if pre_args.read_resource:
-            result = _session_request(
-                sess_name, "read_resource", {"uri": pre_args.read_resource}
-            )
-            output_result(
-                result, pretty=pre_args.pretty, raw=pre_args.raw, toon=pre_args.toon
-            )
-            return
-        if pre_args.list_prompts:
-            result = _session_request(sess_name, "list_prompts")
-            output_result(
-                result, pretty=pre_args.pretty, raw=pre_args.raw, toon=pre_args.toon
-            )
-            return
-        if pre_args.get_prompt:
-            p_args = {}
-            for pa in pre_args.prompt_arg:
-                if "=" in pa:
-                    k, v = pa.split("=", 1)
-                    p_args[k] = v
-            result = _session_request(
-                sess_name,
-                "get_prompt",
-                {"name": pre_args.get_prompt, "arguments": p_args},
-            )
-            output_result(
-                result, pretty=pre_args.pretty, raw=pre_args.raw, toon=pre_args.toon
-            )
-            return
-        if pre_args.list_commands:
-            result = _session_request(sess_name, "list_tools")
-            commands = extract_mcp_commands(result)
-            if search_pattern:
-                commands = _filter_commands(commands, search_pattern)
-                if not commands:
-                    print(f"\nNo tools matching '{search_pattern}'.")
-                    return
-                print(f"\nTools matching '{search_pattern}':")
-            else:
-                print("\nAvailable tools:")
-            list_mcp_commands(commands)
-            return
-
-        # Tool call via session
-        if not remaining:
-            # Fetch tools to show
-            result = _session_request(sess_name, "list_tools")
-            commands = extract_mcp_commands(result)
-            print("Available tools:")
-            list_mcp_commands(commands)
-            print("\nUse --list for the same output, or provide a subcommand.")
-            return
-
-        # Build argparse from cached/session tools
-        tools = _session_request(sess_name, "list_tools")
-        commands = extract_mcp_commands(tools)
-        pre_for_session = argparse.ArgumentParser(add_help=False)
-        parser = build_argparse(commands, pre_for_session)
-        args = parser.parse_args(remaining)
-
-        if not hasattr(args, "_cmd"):
-            parser.print_help()
-            sys.exit(1)
-
-        cmd: CommandDef = args._cmd
-        if getattr(args, "stdin", False):
-            arguments = read_stdin_json(f"session {sess_name} tool arguments")
-        else:
-            arguments = {}
-            for p in cmd.params:
-                val = getattr(args, p.name.replace("-", "_"), None)
-                if val is not None:
-                    arguments[p.original_name] = coerce_value(val, p.schema)
-
+    if pre_args.list_resources:
+        result = _session_request(sess_name, "list_resources")
+        output_result(
+            result, pretty=pre_args.pretty, raw=pre_args.raw, toon=pre_args.toon
+        )
+        return True
+    if pre_args.list_resource_templates:
+        result = _session_request(sess_name, "list_resource_templates")
+        output_result(
+            result, pretty=pre_args.pretty, raw=pre_args.raw, toon=pre_args.toon
+        )
+        return True
+    if pre_args.read_resource:
         result = _session_request(
-            sess_name, "call_tool", {"name": cmd.tool_name, "arguments": arguments}
+            sess_name, "read_resource", {"uri": pre_args.read_resource}
         )
         output_result(
             result, pretty=pre_args.pretty, raw=pre_args.raw, toon=pre_args.toon
         )
-        return
+        return True
+    if pre_args.list_prompts:
+        result = _session_request(sess_name, "list_prompts")
+        output_result(
+            result, pretty=pre_args.pretty, raw=pre_args.raw, toon=pre_args.toon
+        )
+        return True
+    if pre_args.get_prompt:
+        p_args = {}
+        for pa in pre_args.prompt_arg:
+            if "=" in pa:
+                k, v = pa.split("=", 1)
+                p_args[k] = v
+        result = _session_request(
+            sess_name,
+            "get_prompt",
+            {"name": pre_args.get_prompt, "arguments": p_args},
+        )
+        output_result(
+            result, pretty=pre_args.pretty, raw=pre_args.raw, toon=pre_args.toon
+        )
+        return True
+    if pre_args.list_commands:
+        result = _session_request(sess_name, "list_tools")
+        commands = extract_mcp_commands(result)
+        if search_pattern:
+            commands = _filter_commands(commands, search_pattern)
+            if not commands:
+                print(f"\nNo tools matching '{search_pattern}'.")
+                return True
+            print(f"\nTools matching '{search_pattern}':")
+        else:
+            print("\nAvailable tools:")
+        list_mcp_commands(commands)
+        return True
 
-    # Determine resource/prompt actions
+    # Tool call via session
+    if not remaining:
+        result = _session_request(sess_name, "list_tools")
+        commands = extract_mcp_commands(result)
+        print("Available tools:")
+        list_mcp_commands(commands)
+        print("\nUse --list for the same output, or provide a subcommand.")
+        return True
+
+    tools = _session_request(sess_name, "list_tools")
+    commands = extract_mcp_commands(tools)
+    pre_for_session = argparse.ArgumentParser(add_help=False)
+    parser = build_argparse(commands, pre_for_session)
+    args = parser.parse_args(remaining)
+
+    if not hasattr(args, "_cmd"):
+        parser.print_help()
+        sys.exit(1)
+
+    cmd: CommandDef = args._cmd
+    if getattr(args, "stdin", False):
+        arguments = read_stdin_json(f"session {sess_name} tool arguments")
+    else:
+        arguments = {}
+        for p in cmd.params:
+            val = getattr(args, p.name.replace("-", "_"), None)
+            if val is not None:
+                arguments[p.original_name] = coerce_value(val, p.schema)
+
+    result = _session_request(
+        sess_name, "call_tool", {"name": cmd.tool_name, "arguments": arguments}
+    )
+    output_result(
+        result, pretty=pre_args.pretty, raw=pre_args.raw, toon=pre_args.toon
+    )
+    return True
+
+
+def _resolve_resource_prompt_actions(pre_args):
+    """Determine resource/prompt actions from parsed args.
+
+    Returns (resource_action, resource_uri, prompt_action, prompt_name, prompt_arguments).
+    """
     resource_action = None
     resource_uri = None
     prompt_action = None
@@ -3133,54 +3125,19 @@ def _main_impl(argv: list[str], bake_config: BakeConfig | None = None):
                 k, v = pa.split("=", 1)
                 prompt_arguments[k] = v
 
-    # --- GraphQL mode ---
-    if pre_args.graphql:
-        handle_graphql(
-            pre_args.graphql,
-            auth_headers,
-            remaining,
-            pre_args.list_commands,
-            pre_args.pretty,
-            pre_args.raw,
-            pre_args.cache_key,
-            pre_args.cache_ttl,
-            pre_args.refresh,
-            toon=pre_args.toon,
-            fields_override=pre_args.fields,
-            oauth_provider=oauth_provider,
-        )
-        return
+    return resource_action, resource_uri, prompt_action, prompt_name, prompt_arguments
 
-    # --- MCP modes ---
-    if pre_args.mcp or pre_args.mcp_stdio:
-        source = pre_args.mcp or pre_args.mcp_stdio
-        is_stdio = pre_args.mcp_stdio is not None
-        handle_mcp(
-            source,
-            is_stdio,
-            auth_headers,
-            env_vars,
-            remaining,
-            pre_args.list_commands,
-            pre_args.pretty,
-            pre_args.raw,
-            pre_args.cache_key,
-            pre_args.cache_ttl,
-            pre_args.refresh,
-            toon=pre_args.toon,
-            transport=pre_args.transport,
-            oauth_provider=oauth_provider,
-            resource_action=resource_action,
-            resource_uri=resource_uri,
-            prompt_action=prompt_action,
-            prompt_name=prompt_name,
-            prompt_arguments=prompt_arguments,
-            search_pattern=search_pattern,
-            bake_config=bake_config,
-        )
-        return
 
-    # --- OpenAPI mode ---
+def _handle_openapi_mode(
+    pre_args,
+    pre: argparse.ArgumentParser,
+    remaining: list[str],
+    auth_headers: list[tuple[str, str]],
+    search_pattern: str | None,
+    bake_config: BakeConfig | None,
+    oauth_provider: "httpx.Auth | None" = None,
+) -> None:
+    """Execute OpenAPI mode: load spec, build parser, execute."""
     spec = load_openapi_spec(
         pre_args.spec,
         auth_headers,
@@ -3242,13 +3199,95 @@ def _main_impl(argv: list[str], bake_config: BakeConfig | None = None):
 
     cmd: CommandDef = args._cmd
     execute_openapi(
-        args,
-        cmd,
-        base_url,
-        auth_headers,
-        pre_args.pretty,
-        pre_args.raw,
-        toon=pre_args.toon,
+        args, cmd, base_url, auth_headers,
+        pre_args.pretty, pre_args.raw, toon=pre_args.toon,
+        oauth_provider=oauth_provider,
+    )
+
+
+def _main_impl(argv: list[str], bake_config: BakeConfig | None = None):
+    pre = _build_main_parser()
+
+    # Split argv at the subcommand boundary so that tool parameters whose
+    # names collide with global options (e.g. --env, --refresh) are not
+    # silently consumed by the pre-parser.  See GH #15.
+    global_argv, tool_argv = _split_at_subcommand(argv, pre)
+    pre_args, leftover = pre.parse_known_args(global_argv)
+    remaining = leftover + tool_argv
+
+    # --search implies --list
+    search_pattern = pre_args.search_pattern
+    if search_pattern:
+        pre_args.list_commands = True
+
+    # Parse auth headers (values support env: and file: prefixes)
+    auth_headers = _parse_kv_list(
+        pre_args.auth_header, ":", "auth header", resolve_values=True
+    )
+    env_vars = dict(_parse_kv_list(pre_args.env, "=", "env"))
+
+    _validate_source_modes(pre_args, pre, remaining)
+    oauth_provider = _setup_oauth(pre_args)
+
+    if _handle_session_operations(
+        pre_args, auth_headers, env_vars, remaining, search_pattern
+    ):
+        return
+
+    resource_action, resource_uri, prompt_action, prompt_name, prompt_arguments = (
+        _resolve_resource_prompt_actions(pre_args)
+    )
+
+    # --- GraphQL mode ---
+    if pre_args.graphql:
+        handle_graphql(
+            pre_args.graphql,
+            auth_headers,
+            remaining,
+            pre_args.list_commands,
+            pre_args.pretty,
+            pre_args.raw,
+            pre_args.cache_key,
+            pre_args.cache_ttl,
+            pre_args.refresh,
+            toon=pre_args.toon,
+            fields_override=pre_args.fields,
+            oauth_provider=oauth_provider,
+        )
+        return
+
+    # --- MCP modes ---
+    if pre_args.mcp or pre_args.mcp_stdio:
+        source = pre_args.mcp or pre_args.mcp_stdio
+        is_stdio = pre_args.mcp_stdio is not None
+        handle_mcp(
+            source,
+            is_stdio,
+            auth_headers,
+            env_vars,
+            remaining,
+            pre_args.list_commands,
+            pre_args.pretty,
+            pre_args.raw,
+            pre_args.cache_key,
+            pre_args.cache_ttl,
+            pre_args.refresh,
+            toon=pre_args.toon,
+            transport=pre_args.transport,
+            oauth_provider=oauth_provider,
+            resource_action=resource_action,
+            resource_uri=resource_uri,
+            prompt_action=prompt_action,
+            prompt_name=prompt_name,
+            prompt_arguments=prompt_arguments,
+            search_pattern=search_pattern,
+            bake_config=bake_config,
+        )
+        return
+
+    # --- OpenAPI mode ---
+    _handle_openapi_mode(
+        pre_args, pre, remaining, auth_headers, search_pattern, bake_config,
         oauth_provider=oauth_provider,
     )
 
