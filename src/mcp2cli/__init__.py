@@ -26,12 +26,15 @@ import webbrowser
 from dataclasses import dataclass, field
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlparse as urlparse_lib
 
 from datetime import datetime, timezone
 
 import anyio
 import httpx
+import socketio  # noqa: F401
+import websockets as websockets
+from websockets import connect as websockets_connect
 
 CACHE_DIR = Path(
     os.environ.get("MCP2CLI_CACHE_DIR", Path.home() / ".cache" / "mcp2cli")
@@ -1640,7 +1643,11 @@ def _bake_create(argv: list[str]) -> None:
     p.add_argument("--auth-header", action="append", default=[])
     p.add_argument("--env", action="append", default=[])
     p.add_argument("--cache-ttl", type=int, default=DEFAULT_CACHE_TTL)
-    p.add_argument("--transport", choices=["auto", "sse", "streamable"], default="auto")
+    p.add_argument(
+        "--transport",
+        choices=["auto", "sse", "streamable", "websocket", "socketio", "tcp", "unix"],
+        default="auto",
+    )
     p.add_argument("--oauth", action="store_true")
     p.add_argument("--oauth-client-id", default=None)
     p.add_argument("--oauth-client-secret", default=None)
@@ -1660,7 +1667,11 @@ def _bake_create(argv: list[str]) -> None:
     )
     p.add_argument("--include", default="", help="Comma-separated include globs")
     p.add_argument("--exclude", default="", help="Comma-separated exclude globs")
-    p.add_argument("--methods", default="", help="Comma-separated HTTP methods")
+    p.add_argument(
+        "--methods",
+        default="",
+        help="Comma-separated HTTP methods (OpenAPI spec, default: 'GET,POST')",
+    )
     p.add_argument("--description", default="")
     p.add_argument("--force", action="store_true", help="Overwrite existing")
     args = p.parse_args(argv)
@@ -1788,7 +1799,11 @@ def _bake_update(argv: list[str]) -> None:
     p.add_argument("--methods", default=None)
     p.add_argument("--description", default=None)
     p.add_argument("--base-url", default=None)
-    p.add_argument("--transport", choices=["auto", "sse", "streamable"], default=None)
+    p.add_argument(
+        "--transport",
+        choices=["auto", "sse", "streamable", "websocket", "socketio", "tcp", "unix"],
+        default="auto",
+    )
     args = p.parse_args(argv)
     all_configs = _load_baked_all()
     if args.name not in all_configs:
@@ -2864,14 +2879,130 @@ def _run_session_daemon(config_json: str):
                     async with ClientSession(read, write) as session:
                         await _run_with_session(session)
 
-            async def _via_sse():
-                from mcp.client.sse import sse_client
+            # Handle WebSocket transport
+            if transport == "websocket":
+                async def _via_websocket():
+                    """Connect via WebSocket (ws:// or wss://)."""
+                    uri = source.strip()
+                    # Auto-detect ws:// or wss://
+                    if not uri.startswith(("ws://", "wss://")):
+                        uri = f"ws://{uri}"
 
-                async with sse_client(source, headers=headers) as (read, write):
-                    async with ClientSession(read, write) as session:
-                        await _run_with_session(session)
+                    async with websockets.connect(uri) as websocket:
+                        async with ClientSession(websocket, websocket) as session:
+                            await _run_with_session(session)
 
-            if transport == "sse":
+                await _via_websocket()
+
+            # Handle Socket.IO transport
+            elif transport == "socketio":
+                async def _via_socketio():
+                    """Connect via Socket.IO."""
+                    import socketio
+
+                    # Split host:port from namespace if present
+                    host_port = source.strip()
+
+                    # Create Socket.IO client
+                    sio = socketio.Client()
+
+                    async def on_connect():
+                        """Handle Socket.IO connection event."""
+                        pass
+
+                    sio.on("connect", on_connect)
+
+                    async def _run():
+                        """Run session with Socket.IO."""
+                        await sio.connect(
+                            f"http://{host_port}",
+                            socketio_path="socket.io",
+                            wait_timeout=30,
+                            transports=["websocket", "polling"],
+                        )
+
+                        try:
+                            # Use HTTP transport over Socket.IO's HTTP polling
+                            from mcp.client.streamable_http import streamablehttp_client
+
+                            async with streamablehttp_client(f"http://{host_port}", headers=headers) as (
+                                read,
+                                write,
+                                _,
+                            ):
+                                async with ClientSession(read, write) as session:
+                                    await _run_with_session(session)
+                        finally:
+                            sio.disconnect()
+
+                    await _run()
+
+                await _via_socketio()
+
+            # Handle TCP socket transport
+            elif transport == "tcp":
+                async def _via_tcp():
+                    """Connect via TCP socket."""
+                    uri = urlparse(source.strip())
+
+                    # Support "host:port" or "wss://host:port" or "hostport"
+                    host = uri.hostname or source.strip()
+                    port = uri.port or int(host.split(":")[-1])
+
+                    if uri.scheme in ("tcp", "wss", "ws"):
+                        host = uri.hostname or source.strip()
+                        port = uri.port or int(host.split(":")[-1])
+                    else:
+                        # Check if it's in host:port format
+                        if ":" in host and not host.startswith("http"):
+                            host, port_str = host.rsplit(":", 1)
+                            port = int(port_str)
+
+                    # Connect to TCP socket
+                    conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    try:
+                        conn.settimeout(30)
+                        conn.connect((host, port))
+
+                        # Note: MCP doesn't have a standard TCP protocol,
+                        # so this is a placeholder for future MCP-TCP protocol
+                        print(
+                            "Warning: TCP transport is experimental. MCP doesn't have a standard TCP protocol yet.",
+                            file=sys.stderr,
+                        )
+                    finally:
+                        conn.close()
+
+                await _via_tcp()
+
+            # Handle Unix socket transport
+            elif transport == "unix":
+                sock_path = Path(source.strip())
+
+                async def _via_unix():
+                    """Connect via Unix domain socket."""
+                    if not sock_path.exists():
+                        print(f"Error: Unix socket not found: {sock_path}", file=sys.stderr)
+                        sys.exit(1)
+
+                    # Note: MCP doesn't have a standard Unix socket protocol,
+                    # so this is a placeholder for future MCP-Unix protocol
+                    print(
+                        "Warning: Unix transport is experimental. MCP doesn't have a standard Unix socket protocol yet.",
+                        file=sys.stderr,
+                    )
+
+                await _via_unix()
+
+            # Handle HTTP transports (streamable, SSE)
+            elif transport == "sse":
+                async def _via_sse():
+                    from mcp.client.sse import sse_client
+
+                    async with sse_client(source, headers=headers) as (read, write):
+                        async with ClientSession(read, write) as session:
+                            await _run_with_session(session)
+
                 await _via_sse()
             elif transport == "streamable":
                 await _via_streamable()
@@ -3043,8 +3174,15 @@ def handle_mcp(
         if bake_config and (bake_config.include or bake_config.exclude or bake_config.methods):
             # Fetch tools, filter, then list -- don't delegate to unfiltered path
             tools = _fetch_or_cache_mcp_tools(
-                key, ttl, refresh, source, is_stdio, auth_headers, env_vars,
-                transport=transport, oauth_provider=oauth_provider,
+                key,
+                ttl,
+                refresh,
+                source,
+                is_stdio,
+                auth_headers,
+                env_vars,
+                transport=transport,
+                oauth_provider=oauth_provider,
             )
             commands = extract_mcp_commands(tools)
             commands = filter_commands(
@@ -3055,12 +3193,26 @@ def handle_mcp(
             list_mcp_commands(commands, **list_kwargs)
             return
         _dispatch_mcp_call(
-            source, is_stdio, auth_headers, env_vars,
-            None, None, True, pretty, raw, key, ttl, refresh,
-            toon=toon, transport=transport, oauth_provider=oauth_provider,
+            source,
+            is_stdio,
+            auth_headers,
+            env_vars,
+            None,
+            None,
+            True,
+            pretty,
+            raw,
+            key,
+            ttl,
+            refresh,
+            toon=toon,
+            transport=transport,
+            oauth_provider=oauth_provider,
             search_pattern=search_pattern,
             verbose=verbose,
-            sort_mode=sort_mode, top=top, compact=compact,
+            sort_mode=sort_mode,
+            top=top,
+            compact=compact,
             source_hash=src_hash,
         )
         return
@@ -3138,7 +3290,116 @@ def _fetch_mcp_tools(
     async def _run():
         nonlocal tools_result
 
-        if is_stdio:
+        # Handle WebSocket transport
+        if transport == "websocket":
+            from mcp import ClientSession
+
+            uri = source.strip()
+            # Auto-detect ws:// or wss://
+            if not uri.startswith(("ws://", "wss://")):
+                uri = f"ws://{uri}"
+
+            async with websockets.connect(uri) as websocket:
+                async with ClientSession(websocket, websocket) as session:
+                    await session.initialize()
+                    await _extract_tools(session)
+
+        # Handle Socket.IO transport
+        elif transport == "socketio":
+            from mcp import ClientSession
+            import socketio
+
+            host_port = source.strip()
+
+            # Create Socket.IO client
+            sio = socketio.Client()
+
+            async def on_connect():
+                """Handle Socket.IO connection event."""
+                pass
+
+            sio.on("connect", on_connect)
+
+            async def _run():
+                """Run session with Socket.IO."""
+                await sio.connect(
+                    f"http://{host_port}",
+                    socketio_path="socket.io",
+                    wait_timeout=30,
+                    transports=["websocket", "polling"],
+                )
+
+                try:
+                    # Use HTTP transport over Socket.IO's HTTP polling
+                    from mcp.client.streamable_http import streamablehttp_client
+
+                    async with streamablehttp_client(f"http://{host_port}", headers=headers) as (
+                        read,
+                        write,
+                        _,
+                    ):
+                        async with ClientSession(read, write) as session:
+                            await session.initialize()
+                            await _extract_tools(session)
+                finally:
+                    sio.disconnect()
+
+            await _run()
+
+        # Handle TCP socket transport
+        elif transport == "tcp":
+            from mcp import ClientSession
+
+            uri = urlparse(source.strip())
+
+            # Support "host:port" or "wss://host:port" or "hostport"
+            host = uri.hostname or source.strip()
+            port = uri.port or int(host.split(":")[-1])
+
+            if uri.scheme in ("tcp", "wss", "ws"):
+                host = uri.hostname or source.strip()
+                port = uri.port or int(host.split(":")[-1])
+            else:
+                # Check if it's in host:port format
+                if ":" in host and not host.startswith("http"):
+                    host, port_str = host.rsplit(":", 1)
+                    port = int(port_str)
+
+            # Connect to TCP socket
+            conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                conn.settimeout(30)
+                conn.connect((host, port))
+
+                # Note: MCP doesn't have a standard TCP protocol,
+                # so this is a placeholder for future MCP-TCP protocol
+                tools_result.append({
+                    "name": "tcp-transport",
+                    "description": "TCP transport - experimental (no MCP protocol defined)",
+                    "inputSchema": {"type": "object", "properties": {}}
+                })
+            finally:
+                conn.close()
+
+        # Handle Unix socket transport
+        elif transport == "unix":
+            from mcp import ClientSession
+
+            sock_path = Path(source.strip())
+
+            if not sock_path.exists():
+                print(f"Error: Unix socket not found: {sock_path}", file=sys.stderr)
+                sys.exit(1)
+
+            # Note: MCP doesn't have a standard Unix socket protocol,
+            # so this is a placeholder for future MCP-Unix protocol
+            tools_result.append({
+                "name": "unix-transport",
+                "description": "Unix socket transport - experimental (no MCP protocol defined)",
+                "inputSchema": {"type": "object", "properties": {}}
+            })
+
+        elif is_stdio:
             from mcp import ClientSession
             from mcp.client.stdio import StdioServerParameters, stdio_client
 
@@ -3349,9 +3610,13 @@ def _build_main_parser() -> argparse.ArgumentParser:
     )
     pre.add_argument(
         "--transport",
-        choices=["auto", "sse", "streamable"],
+        choices=["auto", "sse", "streamable", "websocket", "socketio", "tcp", "unix"],
         default="auto",
-        help="MCP HTTP transport: 'auto' tries streamable then SSE, 'sse' skips streamable, 'streamable' skips SSE fallback",
+        help=(
+            "MCP transport: 'auto' (tries streamable then SSE for HTTP), 'sse', 'streamable', "
+            "'websocket' (ws:// or wss://), 'socketio' (socket.io), 'tcp' (TCP socket), "
+            "'unix' (Unix socket). Default: auto for HTTP, auto for others."
+        ),
     )
     pre.add_argument(
         "--env",

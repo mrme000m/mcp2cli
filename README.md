@@ -54,6 +54,47 @@ mcp2cli --mcp https://mcp.example.com/sse --transport sse --list
 mcp2cli --mcp https://mcp.example.com/sse --search "task"
 ```
 
+### MCP WebSocket mode for testing
+
+```bash
+# Connect via WebSocket (must be supported by MCP server)
+mcp2cli --mcp ws://mcp.example.com/sse --list
+mcp2cli --mcp wss://secure-mcp.example.com/sse --list
+
+# Call a tool over WebSocket
+mcp2cli --mcp ws://mcp.example.com/sse search --query "test" --transport websocket
+```
+
+### MCP Socket.IO mode for modern gateways
+
+```bash
+# Connect via Socket.IO (uses HTTP polling as fallback)
+mcp2cli --mcp mcp.example.com:3000 --transport socketio --list
+
+# Call a tool over Socket.IO
+mcp2cli --mcp mcp.example.com:3000 --transport socketio search --query "test"
+```
+
+### MCP TCP socket mode (experimental)
+
+```bash
+# Connect via TCP socket
+mcp2cli --mcp mcp.example.com:8080 --transport tcp --list
+
+# Use "tcp://" or host:port format
+mcp2cli --mcp tcp://mcp.example.com:8080 --transport tcp --list
+```
+
+### MCP Unix socket mode (experimental)
+
+```bash
+# Connect via Unix domain socket
+mcp2cli --mcp /var/run/mcp.sock --transport unix --list
+
+# Fallback to HTTP transports
+mcp2cli --mcp https://mcp.example.com/sse --transport sse --list
+```
+
 `--search` implies `--list` and works across all modes (`--mcp`, `--spec`, `--graphql`, `--mcp-stdio`).
 
 ### OAuth authentication

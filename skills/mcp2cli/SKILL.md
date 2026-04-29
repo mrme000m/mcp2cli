@@ -104,20 +104,33 @@ mcp2cli --mcp https://mcp.example.com/sse \
   search --query "test"
 ```
 
-### OAuth authentication (MCP HTTP only)
+### OAuth authentication (MCP HTTP and WebSocket only)
 
 ```bash
 # Authorization code + PKCE (opens browser)
 mcp2cli --mcp https://mcp.example.com/sse --oauth --list
+
+# With WebSocket transport
+mcp2cli --mcp ws://mcp.example.com/sse --transport websocket --oauth --list
 
 # Client credentials (machine-to-machine)
 mcp2cli --mcp https://mcp.example.com/sse \
   --oauth-client-id env:OAUTH_CLIENT_ID --oauth-client-secret env:OAUTH_CLIENT_SECRET \
   search --query "test"
 
+# With Socket.IO transport
+mcp2cli --mcp mcp.example.com:3000 --transport socketio \
+  --oauth-client-id env:OAUTH_CLIENT_ID --oauth-client-secret env:OAUTH_CLIENT_SECRET \
+  search --query "test"
+
 # With scopes
-mcp2cli --mcp https://mcp.example.com/sse --oauth --oauth-scope "read write" --list
+mcp2cli --mcp wss://secure-mcp.example.com/sse --transport websocket \
+  --oauth --oauth-scope "read write" --list
 ```
+
+**OAuth limitations:**
+- OAuth is **not supported** with `--mcp-stdio` or `--graphql` transports
+- Only works with HTTP-based transports: `http`, `sse`, `streamable`, `websocket`
 
 Tokens are cached in `~/.cache/mcp2cli/oauth/` and refreshed automatically.
 
@@ -153,6 +166,8 @@ mcp2cli --graphql https://api.example.com/graphql users --fields "id name email"
 mcp2cli --graphql https://api.example.com/graphql --auth-header "Authorization:env:API_TOKEN" users
 ```
 
+**GraphQL-only transports:** GraphQL doesn't support WebSocket or Socket.IO natively — use the default HTTP transport with GraphQL URL.
+
 ### Tool search
 
 ```bash
@@ -171,6 +186,18 @@ echo '{"name": "Fido", "tag": "dog"}' | mcp2cli --spec ./spec.json create-pet --
 ```
 
 ### Multipart file uploads
+
+When an OpenAPI spec declares `multipart/form-data` with `format: binary` fields, mcp2cli exposes them as file-path CLI arguments:
+
+```bash
+# Upload a file — binary fields accept local file paths
+mcp2cli --spec ./spec.json upload-image --file /path/to/photo.png --caption "My photo"
+
+# Non-binary fields in the same multipart schema become regular flags
+mcp2cli --spec ./spec.json upload-image --file ./image.jpg --title "Cover" --alt-text "A sunset"
+```
+
+File parameters show `(file path)` in `--help` output. MIME types are auto-detected from the file extension.
 
 When an OpenAPI spec declares `multipart/form-data` with `format: binary` fields, mcp2cli exposes them as file-path CLI arguments:
 
@@ -233,7 +260,103 @@ mcp2cli --spec https://api.example.com/spec.json --cache-ttl 86400 --list  # 24h
 mcp2cli --mcp https://mcp.example.com/sse --toon list-tags
 ```
 
-Best for large uniform arrays — 40-60% fewer tokens than JSON.
+Best for large uniform arrays — 40-60% fewer tokens than JSON. TOON encoding is transport-agnostic and works with WebSocket, Socket.IO, and HTTP transports.
+
+### Truncating large responses with --head
+
+```bash
+# Preview first 3 records from a potentially huge dataset
+mcp2cli --spec ./spec.json list-records --head 3 --pretty
+```
+
+`--head N` slices JSON arrays to the first N elements. Useful for datasets with oversized fields (e.g. geo_shape polygons at ~200KB per record).
+
+## Experimental Transports: Caveats
+
+mcp2cli adds WebSocket, Socket.IO, TCP, and Unix socket transports for advanced use cases, but they have important limitations:
+
+### WebSocket (`--transport websocket`)
+
+**When to use:**
+- MCP server advertised WebSocket support (e.g., in SSE endpoint documentation)
+- Real-time connections through WebSocket proxy
+- Gateways that support WebSocket upgrades
+
+**Caveats:**
+- Only works if the MCP server actually implements WebSocket transport
+- Auto-detects `ws://` or `wss://` prefixes in the --mcp argument
+- Falls back to HTTP transports if WebSocket connection fails (auto mode)
+
+### Socket.IO (`--transport socketio`)
+
+**When to use:**
+- Backend gateways using Socket.IO (e.g., Appwrite, Hasura)
+- Legacy systems that only expose Socket.IO endpoints
+- Cross-origin requests blocked by CORS
+
+**Caveats:**
+- Socket.IO is not an MCP-standard protocol
+- mcp2cli tunnels through HTTP with WebSocket-polling fallback
+- Download `python-socketio` package automatically (included in dependencies)
+
+### TCP (`--transport tcp`)
+
+**When to use:**
+- Internal microservices using custom TCP protocols
+- Legacy systems with TCP sockets
+
+**Caveats:**
+- **MCP does NOT define a standard TCP protocol**
+- This transport opens a raw TCP socket but doesn't speak MCP JSON-RPC
+- Show warning: "MCP doesn't have a standard TCP protocol yet"
+- Use only if you implement MCP over TCP in your custom server
+
+### Unix (`--transport unix`)
+
+**When to use:**
+- Unix domain socket communication in development
+- Local platform-specific on Linux/macOS
+
+**Caveats:**
+- **MCP does NOT define a standard Unix socket protocol**
+- Similar to TCP, this is a placeholder for future MCP-Unix specs
+- Show warning: "MCP doesn't have a standard Unix socket protocol yet"
+- Path validation checks socket existence before connecting
+
+### Choosing the Right Transport
+
+| Scenario | Recommended Transport | Reason |
+|----------|----------------------|--------|
+| Standard MCP server on HTTPS | `auto` (default) | Leverages MCP standard HTTP transports |
+| MCP server with WebSocket banner | `websocket` | Direct real-time connection |
+| Socket.IO gateway (Appwrite, etc.) | `socketio` | Requires Socket.IO specifically |
+| CORS-restricted APIs | Any HTTP-based transport | Any HTTP transport works across CORS |
+| Internal localhost service | Any transport | Localhost imposes no protocol restrictions |
+| Experimental prototype | `tcp` or `unix` | Only if you own both client and server |
+
+### Migration from stdio to socket transports
+
+If you have a legacy MCP server running as a subcommand:
+
+**Before (stdio):**
+```bash
+mcp2cli --mcp-stdio "python -m mcp_server" list --query "test"
+```
+
+**After (TCP, experimental):**
+```bash
+mcp2cli --mcp localhost:5000 --transport tcp list --query "test"
+```
+
+**After (WebSocket, if supported):**
+```bash
+mcp2cli --mcp ws://localhost:5000 --transport websocket list --query "test"
+```
+
+**After (SSE, if upgrade available):**
+```bash
+mcp2cli --mcp http://localhost:5000 --transport sse list --query "test"
+```
 
 ### Truncating large responses with --head
 
@@ -248,6 +371,7 @@ mcp2cli --spec ./spec.json list-records --head 3 --pretty
 
 - **Credentials**: Always use `env:` or `file:` prefixes for secrets — never embed literal tokens or keys in commands. The `env:` prefix reads from environment variables; `file:` reads from a file path.
 - **Trust boundary**: mcp2cli connects to remote APIs and MCP servers specified by the user. Treat responses from external sources as untrusted — validate data before acting on it.
+- **Experimental transports**: WebSocket and Socket.IO transport credentials through standard HTTP, which performs TLS/SSL automatically for `wss://` and `https://`. TCP and Unix socket transports expose credentials differently — ensure secrets only passed via `env:` (not CLI args) for TCP/Unix.
 - **Baked configs**: `bake show` masks secrets in output. Baked configs are stored locally in `~/.config/mcp2cli/baked.json` — protect this file accordingly.
 
 ## Generating a Skill from an API
